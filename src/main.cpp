@@ -72,7 +72,8 @@ int wifiRetries = 0;
 const int WIFI_MAX_RETRIES = 20;
 
 bool loraOk = false;
-RTC_DATA_ATTR bool batteryWarningSent = false;
+bool batteryWarningGarageSent = false;
+bool batteryWarningDoorSent = false;
 
 bool isWaitingForCloseConfirmation = false;
 unsigned long closeCommandTimestamp = 0;
@@ -269,22 +270,52 @@ void publishToThingspeak(const LoRaPayload& p, int tuerStatus) {
 #endif
 
 // ---------------- HTTP-Funktionen ----------------
-void sendNtfyNotification(const String message) {
-  if (!isWiFiConnected()) {
-    Serial.println("[NTFY] No WiFi, skipping notification." + getTimeStamp());
-    return;
+// ---------------- Ntfy Task (Läuft asynchron im Hintergrund) ----------------
+void ntfyBackgroundTask(void * parameter) {
+  // 1. Den übergebenen String-Pointer in ein lokales Objekt kopieren 
+  // und den reservierten RAM sofort wieder freigeben!
+  String* msgPtr = (String*)parameter;
+  String message = *msgPtr;
+  delete msgPtr; 
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    char ntfyUrl[128];
+    snprintf(ntfyUrl, sizeof(ntfyUrl), "https://ntfy.sh/%s", NTFY_TOPIC_NAME);
+    
+    http.begin(ntfyUrl);
+    http.addHeader("Content-Type", "text/plain");
+    http.setTimeout(5000); // Kurzes 5-Sekunden Timeout reicht aus!
+    
+    int httpCode = http.POST(message);
+    if (httpCode != 200) {
+      Serial.printf("[NTFY] Failed to send async notification, HTTP code: %d %s\n", httpCode, getTimeStamp().c_str());
+    } else {
+      Serial.println("[NTFY] Push-Nachricht erfolgreich versendet." + getTimeStamp());
+    }
+    http.end();
+  } else {
+    Serial.println("[NTFY] No WiFi, skipped async notification.");
   }
-  HTTPClient http;
-  char ntfyUrl[128];
-  snprintf(ntfyUrl, sizeof(ntfyUrl), "https://ntfy.sh/%s", NTFY_TOPIC_NAME);
-  http.begin(ntfyUrl);
-  http.addHeader("Content-Type", "text/plain");
-  http.setTimeout(15000);
-  int httpCode = http.POST(message);
-  if (httpCode != 200) {
-    Serial.printf("[NTFY] Failed to send notification, HTTP code: %d %s\n", httpCode, getTimeStamp().c_str());
-  }
-  http.end();
+  
+  // WICHTIG: Task sauber beenden!
+  vTaskDelete(NULL); 
+}
+
+// ---------------- Neue Hilfsfunktion für den Aufruf ----------------
+void sendNtfyNotificationAsync(const String& message) {
+  // Speicher auf dem Heap (RAM) reservieren, damit der String 
+  // die kurze Zeit überlebt, bis der Task wirklich startet.
+  String* msgCopy = new String(message);
+  
+  xTaskCreate(
+    ntfyBackgroundTask,
+    "NtfyTask",
+    4096,             // Speicher für den Task
+    (void*)msgCopy,   // Wir übergeben den Pointer auf unseren String
+    1,                // Normale Priorität
+    NULL
+  );
 }
 
 // ---------------- Nuki Task (Läuft asynchron im Hintergrund) ----------------
@@ -325,6 +356,8 @@ void nukiBackgroundTask(void * parameter) {
 
   if (!success) {
     Serial.println("[NUKI] Failed after " + String(maxRetries) + " attempts." + getTimeStamp());
+    // NEU: Wenn Nuki 3x versagt, schicke sofort einen Alarm aufs Handy!
+    sendNtfyNotificationAsync("Achtung: Nuki Türöffner konnte nicht erreicht werden!");
   }
 
   // WICHTIG: Task muss sich am Ende selbst zerstören, sonst stürzt der ESP ab!
@@ -353,15 +386,29 @@ void readAvailableLoraMessages() {
       LoRaPayload payload;
       memcpy(&payload, rsc.data, sizeof(LoRaPayload));
       
-      if (payload.batteryVoltage < BATTERY_WARNING_VOLTAGE_SENDER) {
-        if (!batteryWarningSent) {
-          Serial.printf("[BATTERY_WARN] Akku des Senders unter %.2fV (%.2fV)! Sende ntfy-Meldung... %s\n",
-                        BATTERY_WARNING_VOLTAGE_SENDER, payload.batteryVoltage, getTimeStamp().c_str());
-          sendNtfyNotification("Sender-Batterie niedrig: " + String(payload.batteryVoltage, 2) + "V!");
-          batteryWarningSent = true;
+// --- NEUE GETRENNTE BATTERIE-ÜBERWACHUNG ---
+      if (payload.actionID == NUKI_TRIGGER_ID) {
+        // Logik für den Türsender (Nuki)
+        if (payload.batteryVoltage < BATTERY_WARNING_VOLTAGE_SENDER) {
+          if (!batteryWarningDoorSent) {
+            Serial.printf("[BATTERY_WARN] Tür-Sender Akku niedrig: %.2fV! %s\n", payload.batteryVoltage, getTimeStamp().c_str());
+            sendNtfyNotificationAsync("Tür-Sender Batterie niedrig: " + String(payload.batteryVoltage, 2) + "V!");
+            batteryWarningDoorSent = true;
+          }
+        } else {
+          batteryWarningDoorSent = false; // Zurücksetzen, wenn Akku wieder voll ist
         }
       } else {
-        batteryWarningSent = false;
+        // Logik für den Garagensender
+        if (payload.batteryVoltage < BATTERY_WARNING_VOLTAGE_SENDER) {
+          if (!batteryWarningGarageSent) {
+            Serial.printf("[BATTERY_WARN] Garagen-Sender Akku niedrig: %.2fV! %s\n", payload.batteryVoltage, getTimeStamp().c_str());
+            sendNtfyNotificationAsync("Garagen-Sender Batterie niedrig: " + String(payload.batteryVoltage, 2) + "V!");
+            batteryWarningGarageSent = true;
+          }
+        } else {
+          batteryWarningGarageSent = false; // Zurücksetzen, wenn Akku wieder voll ist
+        }
       }
 
       if (payload.actionID == NUKI_TRIGGER_ID) {
@@ -590,7 +637,7 @@ void loop() {
       Serial.printf("[TOR] Status hat sich von %d zu %d geändert! Sende Benachrichtigung... %s\n",
                     letzterBekannterTorstatus, payloadToProcess.torStatus, getTimeStamp().c_str());
 
-      if (isWiFiConnected()) sendNtfyNotification("Garagentor ist jetzt " + statusText);
+      if (isWiFiConnected()) sendNtfyNotificationAsync("Garagentor ist jetzt " + statusText);
 
       letzterBekannterTorstatus = payloadToProcess.torStatus;
       EEPROM.write(0, letzterBekannterTorstatus);
@@ -643,7 +690,7 @@ void loop() {
     }
     else if (millis() - closeCommandTimestamp > CLOSE_CONFIRMATION_TIMEOUT) {
         Serial.println("[GARAGE_CMD] FEHLER: Tor nach 45 Sekunden nicht als geschlossen gemeldet!" + getTimeStamp());
-        sendNtfyNotification("Garagentor Fehler");
+        sendNtfyNotificationAsync("Garagentor Fehler");
         isWaitingForCloseConfirmation = false;
     }
   }
