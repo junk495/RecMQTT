@@ -79,6 +79,13 @@ bool isWaitingForCloseConfirmation = false;
 unsigned long closeCommandTimestamp = 0;
 const unsigned long CLOSE_CONFIRMATION_TIMEOUT = 45000;
 
+// --- NEU: Stabilitäts-Variablen ---
+const unsigned long DAILY_RESTART_INTERVAL = 86400000UL; // 24 Stunden in Millisekunden
+unsigned long lastLoraCheck = 0;
+const unsigned long LORA_CHECK_INTERVAL = 600000UL; // 10 Minuten für den LoRa-Watchdog
+uint16_t lastNukiMessageID = 0; // Für den Duplikat-Filter
+// ----------------------------------
+
 #if USE_HIVEMQ
 WiFiClientSecure hive_espClientSecure;
 PubSubClient hive_mqttClient(hive_espClientSecure);
@@ -306,9 +313,14 @@ void ntfyBackgroundTask(void * parameter) {
 void sendNtfyNotificationAsync(const String& message) {
   // Speicher auf dem Heap (RAM) reservieren, damit der String 
   // die kurze Zeit überlebt, bis der Task wirklich startet.
-  String* msgCopy = new String(message);
+  String* msgCopy = new (std::nothrow) String(message);
   
-  xTaskCreate(
+  if (msgCopy == nullptr) {
+    Serial.println("[NTFY] Zu wenig Speicher für Push-Nachricht!");
+    return;
+  }
+
+  BaseType_t xReturned = xTaskCreate(
     ntfyBackgroundTask,
     "NtfyTask",
     4096,             // Speicher für den Task
@@ -316,6 +328,12 @@ void sendNtfyNotificationAsync(const String& message) {
     1,                // Normale Priorität
     NULL
   );
+
+  // Memory Leak verhindern: Wenn Task nicht startet, Speicher sofort freigeben!
+  if (xReturned != pdPASS) {
+    Serial.println("[NTFY] Fehler beim Starten des Ntfy-Tasks!");
+    delete msgCopy;
+  }
 }
 
 // ---------------- Nuki Task (Läuft asynchron im Hintergrund) ----------------
@@ -334,13 +352,14 @@ void nukiBackgroundTask(void * parameter) {
     Serial.printf("[NUKI] Triggering Nuki (Attempt %d)... %s\n", attempt, getTimeStamp().c_str());
     
     HTTPClient http;
-    // Timeout auf 5 Sekunden reduzieren, das reicht im lokalen Netz völlig aus!
-    http.setTimeout(5000); 
+    // Timeout auf 15 Sekunden erhöht, da Nuki Bridge oft länger braucht!
+    http.setTimeout(15000); 
     http.begin(NUKI_SERVERPATH);
     
     int httpCode = http.GET();
     
-    if (httpCode > 0) {
+    // Nur ein echter 200 OK Code gilt als Erfolg!
+    if (httpCode == 200) {
       Serial.println("[NUKI] Erfolg! HTTP-Code: " + String(httpCode) + " " + getTimeStamp());
       success = true;
       http.end();
@@ -367,7 +386,7 @@ void nukiBackgroundTask(void * parameter) {
 // ---------------- Neue Hilfsfunktion zum Starten ----------------
 void triggerNukiAsync() {
   // Startet den Task im Hintergrund auf dem ESP32
-  xTaskCreate(
+  BaseType_t xReturned = xTaskCreate(
     nukiBackgroundTask,   // Die Funktion, die ausgeführt werden soll
     "NukiTask",           // Ein Name für den Task (fürs Debugging)
     4096,                 // RAM-Speicher (Stack), der reserviert wird
@@ -375,6 +394,10 @@ void triggerNukiAsync() {
     1,                    // Priorität (1 ist niedrig/normal)
     NULL                  // Kein Task-Handle benötigt
   );
+
+  if (xReturned != pdPASS) {
+    Serial.println("[NUKI] KRITISCH: Konnte Nuki-Task nicht starten (Speicher voll?)");
+  }
 }
 
 
@@ -412,21 +435,28 @@ void readAvailableLoraMessages() {
       }
 
       if (payload.actionID == NUKI_TRIGGER_ID) {
-        LoRaMessage message;
-        message.payload = payload;
-        message.rssi = rsc.rssi;
-        triggerNukiAsync();
-        #if USE_HIVEMQ
-        if (isWiFiConnected()) publishToHiveMQ(message);
-        #endif
-        #if USE_THINGSPEAK
-        if (isWiFiConnected() && millis() - lastThingSpeakPublish >= MIN_THINGSPEAK_INTERVAL) {
-          publishToThingspeak(payload, 1);
-          lastTuerPayload = payload;
-          tuerEventTimestamp = millis();
-          tuerStatusNeedsReset = true;
+        // --- Duplikat-Filter für Nuki ---
+        if (payload.messageID == lastNukiMessageID && lastNukiMessageID != 0) {
+          Serial.printf("[LORA] Duplikat von Tür-Sender (MessageID: %u) ignoriert.\n", payload.messageID);
+        } else {
+          lastNukiMessageID = payload.messageID;
+          
+          LoRaMessage message;
+          message.payload = payload;
+          message.rssi = rsc.rssi;
+          triggerNukiAsync();
+          #if USE_HIVEMQ
+          if (isWiFiConnected()) publishToHiveMQ(message);
+          #endif
+          #if USE_THINGSPEAK
+          if (isWiFiConnected() && millis() - lastThingSpeakPublish >= MIN_THINGSPEAK_INTERVAL) {
+            publishToThingspeak(payload, 1);
+            lastTuerPayload = payload;
+            tuerEventTimestamp = millis();
+            tuerStatusNeedsReset = true;
+          }
+          #endif
         }
-        #endif
       } else {
         int nextTail = (queueTail + 1) % LORA_QUEUE_SIZE;
         if (nextTail == queueHead) {
@@ -599,6 +629,28 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  // --- 1. Präventiver Neustart (alle 24h) ---
+  if (now > DAILY_RESTART_INTERVAL) {
+    Serial.println("[RESTART] 24 Stunden Betriebszeit erreicht. Führe präventiven Neustart durch..." + getTimeStamp());
+    delay(1000);
+    ESP.restart();
+  }
+
+  // --- 2. LoRa Watchdog (alle 10 Min prüfen) ---
+  if (now - lastLoraCheck > LORA_CHECK_INTERVAL) {
+    lastLoraCheck = now;
+    ResponseStructContainer cfg = e220ttl.getConfiguration();
+    if (cfg.status.code != E220_SUCCESS) {
+      Serial.println("[WATCHDOG] KRITISCH: LoRa-Modul antwortet nicht mehr! Neustart..." + getTimeStamp());
+      delay(1000);
+      ESP.restart();
+    } else {
+      Serial.println("[WATCHDOG] LoRa-Modul OK." + getTimeStamp());
+    }
+    cfg.close();
+  }
+  // ---------------------------------------------
 
   updateStatusLed();
   if (e220ttl.available() > 0) readAvailableLoraMessages();
