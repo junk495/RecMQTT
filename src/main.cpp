@@ -287,31 +287,61 @@ void sendNtfyNotification(const String message) {
   http.end();
 }
 
-bool httpNuki() {
-  bool success = false;
+// ---------------- Nuki Task (Läuft asynchron im Hintergrund) ----------------
+void nukiBackgroundTask(void * parameter) {
   const int maxRetries = 3;
+  bool success = false;
+
   for (int attempt = 1; attempt <= maxRetries; attempt++) {
-    if (!isWiFiConnected()) {
-      delay(1000);
+    // Prüfe WLAN, ohne die Hauptschleife zu blockieren
+    if (WiFi.status() != WL_CONNECTED) {
+      // vTaskDelay ist wie delay(), aber es erlaubt der main loop() weiterzulaufen!
+      vTaskDelay(1000 / portTICK_PERIOD_MS); 
       continue;
     }
-    Serial.println("[NUKI] Triggering Nuki (Attempt " + String(attempt) + ")..." + getTimeStamp());
+
+    Serial.printf("[NUKI] Triggering Nuki (Attempt %d)... %s\n", attempt, getTimeStamp().c_str());
+    
     HTTPClient http;
-    http.setTimeout(15000);
+    // Timeout auf 5 Sekunden reduzieren, das reicht im lokalen Netz völlig aus!
+    http.setTimeout(5000); 
     http.begin(NUKI_SERVERPATH);
+    
     int httpCode = http.GET();
+    
     if (httpCode > 0) {
+      Serial.println("[NUKI] Erfolg! HTTP-Code: " + String(httpCode) + " " + getTimeStamp());
       success = true;
-      break;
+      http.end();
+      break; // Abbrechen, da erfolgreich
     } else {
-      delay(500);
+      Serial.printf("[NUKI] Fehler (Code: %d). Warte auf nächsten Versuch...\n", httpCode);
     }
+    
     http.end();
+    // Non-blocking Pause vor dem nächsten Versuch
+    vTaskDelay(1000 / portTICK_PERIOD_MS); 
   }
+
   if (!success) {
     Serial.println("[NUKI] Failed after " + String(maxRetries) + " attempts." + getTimeStamp());
   }
-  return success;
+
+  // WICHTIG: Task muss sich am Ende selbst zerstören, sonst stürzt der ESP ab!
+  vTaskDelete(NULL); 
+}
+
+// ---------------- Neue Hilfsfunktion zum Starten ----------------
+void triggerNukiAsync() {
+  // Startet den Task im Hintergrund auf dem ESP32
+  xTaskCreate(
+    nukiBackgroundTask,   // Die Funktion, die ausgeführt werden soll
+    "NukiTask",           // Ein Name für den Task (fürs Debugging)
+    4096,                 // RAM-Speicher (Stack), der reserviert wird
+    NULL,                 // Keine Parameter übergeben
+    1,                    // Priorität (1 ist niedrig/normal)
+    NULL                  // Kein Task-Handle benötigt
+  );
 }
 
 
@@ -338,7 +368,7 @@ void readAvailableLoraMessages() {
         LoRaMessage message;
         message.payload = payload;
         message.rssi = rsc.rssi;
-        httpNuki();
+        triggerNukiAsync();
         #if USE_HIVEMQ
         if (isWiFiConnected()) publishToHiveMQ(message);
         #endif
